@@ -112,9 +112,10 @@ export const buildClaudeChannelServerConfig = (
 
 export const buildCodexBridgeConfigArgs = (
   runDir: string,
-  source: Agent
+  source: Agent,
+  launchArgv = buildLaunchArgv()
 ): string[] => {
-  const config = buildBridgeServerConfig(runDir, source, buildLaunchArgv());
+  const config = buildBridgeServerConfig(runDir, source, launchArgv);
   const approvalArgs = CODEX_AUTO_APPROVED_BRIDGE_TOOLS.flatMap((tool) => [
     "-c",
     `mcp_servers.${BRIDGE_SERVER}.tools.${tool}.approval_mode=${stringifyToml(
@@ -133,7 +134,8 @@ export const buildCodexBridgeConfigArgs = (
 export const ensureClaudeBridgeConfig = (
   runDir: string,
   source: Agent,
-  serverName = BRIDGE_SERVER
+  serverName = BRIDGE_SERVER,
+  launchArgv = buildLaunchArgv()
 ): string => {
   const path = join(runDir, `${source}-mcp.json`);
   ensureParentDir(path);
@@ -142,7 +144,7 @@ export const ensureClaudeBridgeConfig = (
     `${JSON.stringify(
       buildBridgeFileConfig(
         serverName,
-        buildBridgeServerConfig(runDir, source, buildLaunchArgv())
+        buildBridgeServerConfig(runDir, source, launchArgv)
       ),
       null,
       2

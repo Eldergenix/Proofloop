@@ -41,7 +41,11 @@ const CODEX_TMUX_READY_DELAY_MS = 250;
 const CODEX_TMUX_READY_POLLS = 20;
 const CODEX_TMUX_SEND_FOOTER = "Ctrl+J newline";
 
-export const bridgeRuntimeCommandDeps = { spawn, spawnSync };
+export const bridgeRuntimeCommandDeps = {
+  buildLaunchArgv,
+  spawn,
+  spawnSync,
+};
 
 const bridgeWorkerPath = (runDir: string): string =>
   join(runDir, BRIDGE_WORKER_FILE);
@@ -220,7 +224,11 @@ export const ensureBridgeWorker = (runDir: string): boolean => {
   clearBridgeWorkerPid(runDir);
   try {
     const child = bridgeRuntimeCommandDeps.spawn(
-      [...buildLaunchArgv(), BRIDGE_WORKER_SUBCOMMAND, runDir],
+      [
+        ...bridgeRuntimeCommandDeps.buildLaunchArgv(),
+        BRIDGE_WORKER_SUBCOMMAND,
+        runDir,
+      ],
       {
         detached: DETACH_CHILD_PROCESS,
         env: process.env,

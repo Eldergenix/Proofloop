@@ -11,15 +11,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readRunManifest } from "../../src/loop/run-state";
 
+const testLaunchArgv = ["/opt/bun", "src/loop/main.ts"];
+
 const loadBridge = (
   overrides: {
     injectCodexMessage?: (...args: string[]) => Promise<boolean>;
   } = {}
 ) => {
   mock.restore();
-  mock.module("../../src/loop/launch", () => ({
-    buildLaunchArgv: mock(() => ["/opt/bun", "src/loop/main.ts"]),
-  }));
   if (overrides.injectCodexMessage) {
     mock.module("../../src/loop/codex-app-server", () => ({
       injectCodexMessage: overrides.injectCodexMessage,
@@ -1698,6 +1697,7 @@ test("ensureBridgeWorker launches one app-server worker per active run", async (
     unref: mock(() => undefined),
   }));
   bridge.bridgeRuntimeCommandDeps.spawn = spawn;
+  bridge.bridgeRuntimeCommandDeps.buildLaunchArgv = () => testLaunchArgv;
   const root = makeTempDir();
   const runDir = join(root, "run");
   mkdirSync(runDir, { recursive: true });
@@ -2149,7 +2149,11 @@ test("bridge config helper builds the bridge MCP entry point for Codex", async (
   const root = makeTempDir();
   const runDir = join(root, "run");
 
-  const codexArgs = bridge.buildCodexBridgeConfigArgs(runDir, "codex");
+  const codexArgs = bridge.buildCodexBridgeConfigArgs(
+    runDir,
+    "codex",
+    testLaunchArgv
+  );
   expect(codexArgs).toEqual([
     "-c",
     'mcp_servers.loop-bridge.command="/opt/bun"',
@@ -2176,7 +2180,12 @@ test("bridge config helper writes the Claude MCP config file", async () => {
   const root = makeTempDir();
   const runDir = join(root, "run");
 
-  const path = bridge.ensureClaudeBridgeConfig(runDir, "claude");
+  const path = bridge.ensureClaudeBridgeConfig(
+    runDir,
+    "claude",
+    bridge.BRIDGE_SERVER,
+    testLaunchArgv
+  );
   expect(path).toBe(join(runDir, "claude-mcp.json"));
   expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
     mcpServers: {
@@ -2197,7 +2206,12 @@ test("bridge config helper writes the Claude MCP config file for a custom server
   const runDir = join(root, "run");
   const serverName = bridge.claudeChannelServerName("1", "repo-123");
 
-  const path = bridge.ensureClaudeBridgeConfig(runDir, "claude", serverName);
+  const path = bridge.ensureClaudeBridgeConfig(
+    runDir,
+    "claude",
+    serverName,
+    testLaunchArgv
+  );
   expect(path).toBe(join(runDir, "claude-mcp.json"));
   expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
     mcpServers: {
