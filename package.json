@@ -1,0 +1,36 @@
+{
+  "name": "proofloop",
+  "version": "1.0.32",
+  "description": "Proof-driven Claude and Codex agent loop with adversarial completion review.",
+  "type": "module",
+  "private": true,
+  "author": "Eldergenix",
+  "homepage": "https://github.com/Eldergenix/proofloop#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Eldergenix/proofloop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Eldergenix/proofloop/issues"
+  },
+  "scripts": {
+    "build": "bun build --compile --outfile loop src/cli.ts",
+    "install:global": "bun run build && bun run src/install.ts",
+    "release:patch": "npm version patch && git push --follow-tags",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "typecheck": "tsc --project tsconfig.typecheck.json"
+  },
+  "bin": {
+    "claude-loop": "./src/claude-loop.ts",
+    "codex-loop": "./src/codex-loop.ts",
+    "loop": "./src/cli.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.9",
+    "@types/node": "^25.5.0",
+    "bun-types": "^1.3.11",
+    "typescript": "^5.9.3",
+    "ultracite": "^7.3.2"
+  }
+}

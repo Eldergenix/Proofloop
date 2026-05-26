@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      should_release: ${{ steps.release_check.outputs.should_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "from_tag_push=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ -z "$VERSION" ]; then
+            echo "Missing package.json version" >&2
+            exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "from_tag_push=false" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to release
+        id: release_check
+        run: |
+          if [ "${{ steps.tag.outputs.from_tag_push }}" = "true" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.tag.outputs.tag }} already exists. Skipping release."
+            exit 0
+          fi
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [meta, create-release]
+    if: needs.meta.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_name: loop-linux-x64
+          - os: macos-15-intel
+            asset_name: loop-macos-x64
+          - os: macos-15
+            asset_name: loop-macos-arm64
+          - os: windows-latest
+            asset_name: loop-windows-x64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build CLI
+        run: bun run build
+
+      - name: Rename build artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          if [ -f loop ]; then
+            mv loop ${{ matrix.asset_name }}
+            exit 0
+          fi
+          if [ -f loop.exe ]; then
+            mv loop.exe ${{ matrix.asset_name }}
+            exit 0
+          fi
+          echo "Missing build output file" >&2
+          exit 1
+
+      - name: Rename build artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path loop.exe) {
+            Move-Item -Path loop.exe -Destination ${{ matrix.asset_name }}
+            exit 0
+          }
+          if (Test-Path loop) {
+            Move-Item -Path loop -Destination ${{ matrix.asset_name }}
+            exit 0
+          }
+          throw "Missing build output file"
+
+      - name: Generate SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        run: shasum -a 256 ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 ${{ matrix.asset_name }}).Hash.ToLower()
+          "$hash  ${{ matrix.asset_name }}" | Out-File -Encoding ascii ${{ matrix.asset_name }}.sha256
+
+      - name: Verify checksum file (Unix)
+        if: runner.os != 'Windows'
+        run: shasum -a 256 -c ${{ matrix.asset_name }}.sha256
+
+      - name: Verify checksum file (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $line = Get-Content ${{ matrix.asset_name }}.sha256
+          $expected = ($line -split '\s+')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 ${{ matrix.asset_name }}).Hash.ToLower()
+          if ($expected -ne $actual) { throw "Checksum verification failed: expected $expected, got $actual" }
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          files: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+
+  create-release:
+    needs: meta
+    if: needs.meta.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true

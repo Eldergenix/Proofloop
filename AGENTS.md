@@ -1,0 +1,52 @@
+Please keep the code dead-simple and keep the `src/loop/main.ts` file under 150 lines of code.
+
+# Quick Commands
+
+- Format code: `bun run fix`
+- Check lint/types/style: `bun run check`
+- Run tests: `bun test`
+- Build executable: `bun run build`
+- Install global binary/aliases: `bun run install:global`
+- Cut a patch release: `bun run release:patch`
+
+# Repo Workflows
+
+- Plain-text prompts auto-create `PLAN.md` first, then optionally run `--review-plan`; if you are changing planning behavior, keep that flow aligned.
+- Default CLI behavior is paired Claude/Codex execution with persisted run state under `~/.loop/runs`; preserve `--run-id` / `--session` resume behavior when changing startup, planning, or loop flow.
+- Running `loop` with no args starts the paired interactive tmux workspace (`--tmux`); `loop dashboard` opens the live panel for active sessions, loop-owned paired runs, and tmux sessions. Keep panel-only changes separate from task-running changes when possible.
+- `--tmux` and `--worktree` are first-class execution modes. In paired mode, tmux opens Claude/Codex side-by-side and resumed run ids should stay aligned with matching tmux/worktree names.
+- `--claude-only` and `--codex-only` switch out of the default paired flow; keep single-agent behavior working when changing shared CLI parsing or resume logic.
+- `loop update` / `loop upgrade` are supported manual update commands for installed binaries; source runs should continue to rely on `git pull`.
+- When options are provided without a prompt, `loop` reuses `PLAN.md` if it already exists; keep that fallback aligned with the plain-text prompt planning flow.
+
+# Coding Standards
+
+- Keep functions small and easy to read.
+- Use explicit parameter/return types when they improve clarity.
+- Prefer `unknown` over `any` for unknown values.
+- Use `const` by default, `let` only when reassignment is needed.
+- Prefer `for...of`, optional chaining, nullish coalescing, and template literals.
+- Use early returns to reduce nesting.
+- Use `async/await` instead of promise chains.
+- Throw `Error` objects with clear messages.
+- Extract magic numbers/strings into named constants when reused.
+
+# CLI-Specific Notes
+
+- `console.log`/`console.error` are valid for user-facing CLI output.
+- Remove temporary debugging output before finalizing changes.
+- Validate external input (CLI args, files, and subprocess output).
+
+# Testing
+
+- Keep assertions inside `test()`/`it()` blocks.
+- Prefer async/await over done callbacks.
+- Do not commit `.only` or `.skip`.
+- Prefer module-level mocks (for example `mock.module(...)`) over adding DI-only test seams when possible.
+- Keep tests in the top-level `tests/` directory (mirror `src/` structure); do not co-locate `*.test.ts` inside `src/`.
+
+# Review Focus Beyond Biome
+
+- Business logic correctness
+- Edge cases and failure paths
+- Clear naming and maintainable control flow

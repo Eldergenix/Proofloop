@@ -1,0 +1,1207 @@
+import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { spawn, spawnSync } from "bun";
+import {
+  registerClaudeChannelServer,
+  removeClaudeChannelServer,
+} from "./bridge-claude-registration";
+import {
+  buildClaudeChannelServerConfig,
+  claudeChannelServerName,
+  legacyClaudeChannelServerName,
+  resolveClaudeChannelServerName,
+} from "./bridge-config";
+import { type BridgeTool, quotedBridgeTool } from "./bridge-guidance";
+import { getCodexAppServerUrl, getLastCodexThreadId } from "./codex-app-server";
+import {
+  CODEX_TMUX_PROXY_SUBCOMMAND,
+  findCodexTmuxProxyPort,
+  waitForCodexTmuxProxy,
+} from "./codex-tmux-proxy";
+import { DEFAULT_CLAUDE_MODEL } from "./constants";
+import { buildLoopName, decode, runGit, sanitizeBase } from "./git";
+import { buildLaunchArgv } from "./launch";
+import { preparePairedRun } from "./paired-options";
+import { DETACH_CHILD_PROCESS } from "./process";
+import { SPAWN_TEAM_WITH_WORKTREE_ISOLATION } from "./prompts";
+import {
+  type RunManifest,
+  type RunStorage,
+  resolveExistingRunId,
+  touchRunManifest,
+  updateRunManifest,
+} from "./run-state";
+import {
+  closePersistentCodexSession,
+  releasePersistentCodexSession,
+  startPersistentAgentSession,
+} from "./runner";
+import type { Agent, Options } from "./types";
+
+export const TMUX_FLAG = "--tmux";
+export const TMUX_MISSING_ERROR =
+  "Error: tmux is not installed. Install tmux with: brew install tmux";
+const WORKTREE_FLAG = "--worktree";
+const RUN_ID_FLAG = "--run-id";
+const SESSION_FLAG = "--session";
+const ONLY_MODE_FLAGS = ["--claude-only", "--codex-only"] as const;
+const RUN_BASE_ENV = "LOOP_RUN_BASE";
+const RUN_ID_ENV = "LOOP_RUN_ID";
+const CLAUDE_TRUST_PROMPT = "Is this a project you created or one you trust?";
+const CLAUDE_BYPASS_PROMPT = "running in Bypass Permissions mode";
+const CLAUDE_BYPASS_MODE = "Bypass Permissions mode";
+const CLAUDE_BYPASS_ACCEPT = "Yes, I accept";
+const CLAUDE_EXIT_OPTION = "No, exit";
+const CLAUDE_DEV_CHANNELS_PROMPT = "WARNING: Loading development channels";
+const CLAUDE_DEV_CHANNELS_CONFIRM = "I am using this for local development";
+const CLAUDE_PROMPT_MAX_POLLS = 8;
+const CLAUDE_PROMPT_POLL_DELAY_MS = 250;
+const CLAUDE_PROMPT_SETTLE_POLLS = 2;
+
+interface SpawnResult {
+  exitCode: number;
+  stderr: string;
+}
+
+interface TerminalSize {
+  columns: number;
+  rows: number;
+}
+
+interface GitResult {
+  exitCode: number;
+  stderr: string;
+  stdout: string;
+}
+
+interface TmuxDeps {
+  attach: (session: string) => void;
+  capturePane: (pane: string) => string;
+  closePersistentCodexSession: typeof closePersistentCodexSession;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  findBinary: (cmd: string) => boolean;
+  getCodexAppServerUrl: () => string;
+  getLastCodexThreadId: () => string;
+  getTerminalSize: () => TerminalSize | undefined;
+  isInteractive: () => boolean;
+  launchArgv: string[];
+  log: (line: string) => void;
+  makeClaudeSessionId: () => string;
+  preparePairedRun: typeof preparePairedRun;
+  releasePersistentCodexSession: typeof releasePersistentCodexSession;
+  runGit: (cwd: string, args: string[]) => GitResult;
+  sendKeys: (pane: string, keys: string[]) => void;
+  sendText: (pane: string, text: string) => void;
+  sleep: (ms: number) => Promise<void>;
+  spawn: (args: string[]) => SpawnResult;
+  startCodexProxy: (
+    runDir: string,
+    remoteUrl: string,
+    threadId: string
+  ) => Promise<string>;
+  startPersistentAgentSession: typeof startPersistentAgentSession;
+  updateRunManifest: typeof updateRunManifest;
+}
+
+interface PairedTmuxLaunch {
+  opts: Options;
+  task?: string;
+}
+
+const quoteShellArg = (value: string): string =>
+  `'${value.replaceAll("'", "'\\''")}'`;
+
+const buildShellCommand = (argv: string[]): string =>
+  argv.map(quoteShellArg).join(" ");
+
+const spawnDetachedProcess = (
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  spawnFn: typeof spawn = spawn
+): void => {
+  const child = spawnFn(argv, {
+    detached: DETACH_CHILD_PROCESS,
+    env,
+    stderr: "ignore",
+    stdin: "ignore",
+    stdout: "ignore",
+  });
+  child.unref?.();
+};
+
+const stripTmuxFlag = (argv: string[]): string[] =>
+  argv.filter((arg) => arg !== TMUX_FLAG);
+
+const isSingleAgentMode = (argv: string[]): boolean =>
+  ONLY_MODE_FLAGS.some((flag) => argv.includes(flag));
+
+const capitalize = (value: string): string =>
+  value.slice(0, 1).toUpperCase() + value.slice(1);
+
+const peerAgent = (agent: Agent): Agent =>
+  agent === "claude" ? "codex" : "claude";
+
+const appendProofPrompt = (parts: string[], proof: string): void => {
+  const trimmed = proof.trim();
+  if (!trimmed) {
+    return;
+  }
+  parts.push(`Proof requirements:\n${trimmed}`);
+};
+
+const quotedClaudeTmuxBridgeTool = (
+  serverName: string,
+  tool: BridgeTool
+): string => `"mcp__${serverName}__${tool}"`;
+
+const pairedBridgeGuidance = (
+  agent: Agent,
+  _runId: string,
+  serverName: string
+): string => {
+  if (agent === "claude") {
+    return [
+      `Your bridge MCP server is "${serverName}". Use ${quotedClaudeTmuxBridgeTool(serverName, "send_message")} with target: "codex" for Codex-facing messages, including replies to inbound Codex channel messages; do not send Codex-facing responses as a human-facing message.`,
+      `Use ${quotedClaudeTmuxBridgeTool(serverName, "bridge_status")} or ${quotedClaudeTmuxBridgeTool(serverName, "receive_messages")} only if delivery looks stuck.`,
+    ].join("\n");
+  }
+
+  return [
+    `Use the MCP tool ${quotedBridgeTool(agent, "send_message")} with target: "claude" for Claude-facing messages, not a human-facing message.`,
+    `Use ${quotedBridgeTool(agent, "bridge_status")} or ${quotedBridgeTool(agent, "receive_messages")} only if delivery looks stuck.`,
+  ].join("\n");
+};
+
+const pairedWorkflowGuidance = (opts: Options, agent: Agent): string => {
+  const primary = capitalize(opts.agent);
+  const peer = capitalize(peerAgent(opts.agent));
+
+  if (agent === opts.agent) {
+    return [
+      `You are the main worker. ${peer} reviews and helps on request.`,
+      "Implement and verify first, then ask for review.",
+      "Keep iterating until your own review and the peer review both pass.",
+      "After both pass, handle the PR yourself: create a draft PR or send a follow-up commit to the existing PR.",
+    ].join("\n");
+  }
+
+  return [
+    `${primary} is the main worker. You are the reviewer/support agent.`,
+    "Do not take over the task or create the PR yourself.",
+    `When ${primary} asks, do a real review against the task, proof requirements, and repo state.`,
+    "Send either clear actionable feedback or an explicit approval.",
+  ].join("\n");
+};
+
+const buildPrimaryPrompt = (
+  task: string,
+  opts: Options,
+  runId: string,
+  serverName: string
+): string => {
+  const peer = capitalize(peerAgent(opts.agent));
+  const parts = [
+    `Agent-to-agent pair programming: you are the primary ${capitalize(opts.agent)} agent for this run.`,
+    `Task:\n${task.trim()}`,
+    `Your peer is ${peer}. Do the initial pass yourself, then use ${quotedBridgeTool(opts.agent, "send_message")} when you want review or targeted help from ${peer}.`,
+  ];
+  appendProofPrompt(parts, opts.proof);
+  parts.push(SPAWN_TEAM_WITH_WORKTREE_ISOLATION);
+  parts.push(pairedBridgeGuidance(opts.agent, runId, serverName));
+  parts.push(pairedWorkflowGuidance(opts, opts.agent));
+  parts.push(
+    `Inspect the repo and start. Ask ${peer} for review once you have concrete work or a specific question.`
+  );
+  return parts.join("\n\n");
+};
+
+const buildPeerPrompt = (
+  task: string,
+  opts: Options,
+  agent: Agent,
+  runId: string,
+  serverName: string
+): string => {
+  const primary = capitalize(opts.agent);
+  const parts = [
+    `Agent-to-agent pair programming: ${primary} is the primary agent for this run.`,
+    `Task:\n${task.trim()}`,
+    `You are ${capitalize(agent)}. Do not start implementing or verifying this task on your own.`,
+  ];
+  appendProofPrompt(parts, opts.proof);
+  parts.push(pairedBridgeGuidance(agent, runId, serverName));
+  parts.push(pairedWorkflowGuidance(opts, agent));
+  parts.push(
+    `Wait for ${primary} to send you a targeted request or review ask.`
+  );
+  return parts.join("\n\n");
+};
+
+const buildInteractivePrimaryPrompt = (
+  opts: Options,
+  runId: string,
+  serverName: string
+): string => {
+  const peer = capitalize(peerAgent(opts.agent));
+  const parts = [
+    `Agent-to-agent pair programming: you are the primary ${capitalize(opts.agent)} agent for this run.`,
+    "No task has been assigned yet.",
+    `Your peer is ${peer}. Use ${quotedBridgeTool(opts.agent, "send_message")} for review or help once the human gives you a task.`,
+  ];
+  appendProofPrompt(parts, opts.proof);
+  parts.push(
+    `${SPAWN_TEAM_WITH_WORKTREE_ISOLATION} Apply that once the human gives you a concrete task.`
+  );
+  parts.push(pairedBridgeGuidance(opts.agent, runId, serverName));
+  parts.push(pairedWorkflowGuidance(opts, opts.agent));
+  parts.push(
+    `If the human asks for plan mode, write PLAN.md first, ask ${peer} for a plan review, iterate on PLAN.md, then ask the human to review the plan before implementing.`
+  );
+  parts.push(
+    `Wait for the first human task. Do not implement until one arrives. Once it does, coordinate directly with ${peer} and keep the paired review workflow intact. Do not send a message to ${peer} until then.`
+  );
+  return parts.join("\n\n");
+};
+
+const buildInteractivePeerPrompt = (
+  opts: Options,
+  agent: Agent,
+  runId: string,
+  serverName: string
+): string => {
+  const primary = capitalize(opts.agent);
+  const parts = [
+    `Agent-to-agent pair programming: ${primary} is the primary agent for this run.`,
+    "No task has been assigned yet.",
+    `You are ${capitalize(agent)}. Stay idle until ${primary} sends a specific request or the human clearly assigns you separate work.`,
+  ];
+  appendProofPrompt(parts, opts.proof);
+  parts.push(pairedBridgeGuidance(agent, runId, serverName));
+  parts.push(pairedWorkflowGuidance(opts, agent));
+  parts.push(
+    `If ${primary} asks for a plan review, review PLAN.md only, suggest concrete fixes, and wait for the next request.`
+  );
+  parts.push(
+    `Wait for ${primary} to provide a concrete task or review request. Do not send a message to ${primary} yet. If the human clearly assigns you separate work in this pane, treat that as a new task. If you are answering ${primary}, use the bridge tools instead of a human-facing reply.`
+  );
+  return parts.join("\n\n");
+};
+
+const buildLaunchPrompt = (
+  launch: PairedTmuxLaunch,
+  agent: Agent,
+  runId: string,
+  serverName: string
+): string => {
+  const task = launch.task?.trim();
+  if (!task) {
+    return launch.opts.agent === agent
+      ? buildInteractivePrimaryPrompt(launch.opts, runId, serverName)
+      : buildInteractivePeerPrompt(launch.opts, agent, runId, serverName);
+  }
+  return launch.opts.agent === agent
+    ? buildPrimaryPrompt(task, launch.opts, runId, serverName)
+    : buildPeerPrompt(task, launch.opts, agent, runId, serverName);
+};
+
+const resolveTmuxModel = (agent: Agent, opts: Options): string => {
+  if (agent === "codex") {
+    return opts.agent === "codex"
+      ? opts.codexModel
+      : (opts.codexReviewerModel ?? opts.codexModel);
+  }
+  return opts.agent === "claude"
+    ? DEFAULT_CLAUDE_MODEL
+    : (opts.claudeReviewerModel ?? DEFAULT_CLAUDE_MODEL);
+};
+
+const buildClaudeCommand = (
+  sessionId: string,
+  model: string,
+  channelServer: string,
+  resume: boolean,
+  prompt?: string
+): string[] => {
+  const args = [
+    "claude",
+    resume ? "--resume" : "--session-id",
+    sessionId,
+    "--model",
+    model,
+    "--dangerously-load-development-channels",
+    `server:${channelServer}`,
+    "--dangerously-skip-permissions",
+  ];
+  if (prompt) {
+    args.push(prompt);
+  }
+  return args;
+};
+
+const buildCodexCommand = (
+  remoteUrl: string,
+  model: string,
+  configValues: string[],
+  prompt?: string
+): string[] => {
+  const args = [
+    "codex",
+    "-m",
+    model,
+    ...configValues,
+    "--enable",
+    "tui_app_server",
+    "--remote",
+    remoteUrl,
+  ];
+  if (prompt) {
+    args.push(prompt);
+  }
+  return args;
+};
+
+const parseToken = (argv: string[], flag: string): string | undefined => {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg.startsWith(`${flag}=`)) {
+      const value = arg.slice(flag.length + 1).trim();
+      if (value) {
+        return value;
+      }
+      throw new Error(`Invalid ${flag} value: cannot be empty`);
+    }
+    if (arg === flag) {
+      const value = argv[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error(`Missing value for ${flag}`);
+      }
+      const token = value.trim();
+      if (token) {
+        return token;
+      }
+      throw new Error(`Invalid ${flag} value: cannot be empty`);
+    }
+  }
+  return undefined;
+};
+
+const resolveRequestedRunId = (
+  argv: string[],
+  deps: TmuxDeps
+): string | undefined => {
+  const runId = parseToken(argv, RUN_ID_FLAG);
+  const singleAgentMode = isSingleAgentMode(argv);
+  if (runId) {
+    if (singleAgentMode) {
+      return runId;
+    }
+    const resolved = (() => {
+      try {
+        return resolveExistingRunId(
+          runId,
+          deps.cwd,
+          deps.env.HOME ?? process.env.HOME ?? ""
+        );
+      } catch {
+        return undefined;
+      }
+    })();
+    if (!resolved) {
+      if (cwdMatchesRunId(deps.cwd, runId)) {
+        return runId;
+      }
+      throw new Error(`[loop] paired run "${runId}" does not exist`);
+    }
+    return resolved;
+  }
+
+  const sessionId = parseToken(argv, SESSION_FLAG);
+  if (!sessionId) {
+    return undefined;
+  }
+
+  if (singleAgentMode) {
+    return undefined;
+  }
+
+  const resolved = (() => {
+    try {
+      return resolveExistingRunId(
+        sessionId,
+        deps.cwd,
+        deps.env.HOME ?? process.env.HOME ?? ""
+      );
+    } catch {
+      return undefined;
+    }
+  })();
+  if (!resolved) {
+    if (cwdMatchesRunId(deps.cwd, sessionId)) {
+      return sessionId;
+    }
+    return undefined;
+  }
+  return resolved;
+};
+
+const cwdMatchesRunId = (cwd: string, runId: string): boolean => {
+  const base = sanitizeBase(basename(cwd));
+  return base.endsWith(`-loop-${sanitizeBase(runId)}`);
+};
+
+const MAX_SESSION_ATTEMPTS = 10_000;
+const SESSION_CONFLICT_RE = /duplicate session|already exists/i;
+const NO_SESSION_RE = /no sessions|couldn't find session|session .* not found/i;
+const LOOP_WORKTREE_SUFFIX_RE = /-loop-[a-z0-9][a-z0-9_-]*$/i;
+
+const stripLoopSuffix = (value: string): string =>
+  value.replace(LOOP_WORKTREE_SUFFIX_RE, "") || value;
+
+const resolveRunBase = (
+  cwd: string,
+  deps: TmuxDeps,
+  requestedId?: string
+): string => {
+  const gitResult = (args: string[]): GitResult | undefined => {
+    try {
+      return deps.runGit(cwd, args);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const commonDir = gitResult([
+    "rev-parse",
+    "--path-format=absolute",
+    "--git-common-dir",
+  ]);
+  if (commonDir?.exitCode === 0 && commonDir.stdout) {
+    return sanitizeBase(basename(dirname(commonDir.stdout)));
+  }
+
+  const topLevel = gitResult([
+    "rev-parse",
+    "--path-format=absolute",
+    "--show-toplevel",
+  ]);
+  if (topLevel?.exitCode === 0 && topLevel.stdout) {
+    return sanitizeBase(basename(topLevel.stdout));
+  }
+
+  const base = sanitizeBase(basename(cwd));
+  if (requestedId) {
+    const requestedSuffix = `-loop-${sanitizeBase(requestedId)}`;
+    if (base.endsWith(requestedSuffix)) {
+      return stripLoopSuffix(base.slice(0, -requestedSuffix.length));
+    }
+  }
+  return stripLoopSuffix(base);
+};
+
+const buildRunName = (base: string, runId: string | number): string =>
+  buildLoopName(base, runId);
+
+const worktreeAvailable = (cwd: string, runName: string): boolean => {
+  const repoRoot = (() => {
+    try {
+      return runGit(cwd, ["rev-parse", "--show-toplevel"], "ignore");
+    } catch {
+      return undefined;
+    }
+  })();
+
+  if (!repoRoot) {
+    return true;
+  }
+
+  if (repoRoot.exitCode !== 0 || !repoRoot.stdout) {
+    return true;
+  }
+
+  const path = join(dirname(repoRoot.stdout), runName);
+  if (existsSync(path)) {
+    return false;
+  }
+
+  const branch = (() => {
+    try {
+      return runGit(
+        cwd,
+        ["show-ref", "--verify", "--quiet", `refs/heads/${runName}`],
+        "ignore"
+      );
+    } catch {
+      return undefined;
+    }
+  })();
+  if (!branch) {
+    return true;
+  }
+
+  if (branch.exitCode === 0) {
+    return false;
+  }
+
+  return true;
+};
+
+const commandExists = (cmd: string): boolean => {
+  try {
+    spawnSync([cmd, "-V"], { stderr: "ignore", stdout: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const isSessionConflict = (stderr: string): boolean =>
+  SESSION_CONFLICT_RE.test(stderr);
+
+const isTerminalDimension = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value > 0;
+
+const buildSessionSizeArgs = (deps: TmuxDeps): string[] => {
+  const size = deps.getTerminalSize();
+  if (!size) {
+    return [];
+  }
+  if (!(isTerminalDimension(size.columns) && isTerminalDimension(size.rows))) {
+    return [];
+  }
+  return ["-x", String(size.columns), "-y", String(size.rows)];
+};
+
+const sessionExists = (
+  session: string,
+  spawnFn: TmuxDeps["spawn"]
+): boolean => {
+  const result = spawnFn(["tmux", "has-session", "-t", session]);
+  return result.exitCode === 0;
+};
+
+const keepSessionAttached = (
+  session: string,
+  spawnFn: TmuxDeps["spawn"]
+): void => {
+  spawnFn([
+    "tmux",
+    "set-window-option",
+    "-t",
+    `${session}:0`,
+    "remain-on-exit",
+    "on",
+  ]);
+};
+
+const isSessionGone = (
+  session: string,
+  error: unknown,
+  spawnFn: TmuxDeps["spawn"]
+): boolean =>
+  !sessionExists(session, spawnFn) ||
+  (error instanceof Error && NO_SESSION_RE.test(error.message));
+
+const buildSessionCommand = (
+  deps: TmuxDeps,
+  env: string[],
+  forwardedArgv: string[]
+): string => {
+  return buildShellCommand([
+    "env",
+    ...env,
+    ...deps.launchArgv,
+    ...forwardedArgv,
+  ]);
+};
+
+const tmuxStartupMessage = (paired: boolean): string =>
+  paired
+    ? "[loop] starting paired tmux workspace..."
+    : "[loop] starting tmux session...";
+
+const updatePairedManifest = (
+  deps: TmuxDeps,
+  storage: RunStorage,
+  manifest: RunManifest,
+  claudeSessionId: string,
+  codexRemoteUrl: string,
+  codexThreadId: string,
+  session: string
+): void => {
+  deps.updateRunManifest(storage.manifestPath, (current) =>
+    touchRunManifest(
+      {
+        ...(current ?? manifest),
+        claudeSessionId,
+        codexRemoteUrl,
+        codexThreadId,
+        cwd: deps.cwd,
+        mode: "paired",
+        pid: process.pid,
+        tmuxSession: session,
+      },
+      new Date().toISOString()
+    )
+  );
+};
+
+const registerClaudeChannelServerForRun = (
+  deps: TmuxDeps,
+  serverName: string,
+  runDir: string
+): void => {
+  registerClaudeChannelServer(deps.launchArgv, serverName, runDir, (args) =>
+    deps.spawn(args)
+  );
+};
+
+const cleanupFailedPairedSessionStart = (
+  deps: TmuxDeps,
+  session: string,
+  serverName: string,
+  runId: string
+): void => {
+  try {
+    if (sessionExists(session, deps.spawn)) {
+      deps.spawn(["tmux", "kill-session", "-t", session]);
+    }
+  } catch {
+    // Best-effort cleanup after a failed paired startup.
+  }
+  for (const name of new Set([
+    serverName,
+    legacyClaudeChannelServerName(runId),
+  ])) {
+    removeClaudeChannelServer(name, (args) => deps.spawn(args), deps.log);
+  }
+};
+
+const ensurePairedSessionIds = async (
+  deps: TmuxDeps,
+  opts: Options,
+  storage: RunStorage,
+  manifest: RunManifest,
+  session: string
+): Promise<{
+  claudeSessionId: string;
+  codexRemoteUrl: string;
+  codexThreadId: string;
+}> => {
+  const codexKind = opts.agent === "codex" ? "work" : "review";
+
+  await deps.startPersistentAgentSession(
+    "codex",
+    opts,
+    manifest.codexThreadId || undefined,
+    { codexLaunch: { orphanOnExit: true } },
+    codexKind
+  );
+
+  const claudeSessionId =
+    manifest.claudeSessionId || deps.makeClaudeSessionId();
+  const codexThreadId = deps.getLastCodexThreadId() || manifest.codexThreadId;
+  if (!codexThreadId) {
+    throw new Error("[loop] failed to resolve Codex thread for tmux launch");
+  }
+  const codexRemoteUrl = deps.getCodexAppServerUrl();
+  if (!codexRemoteUrl) {
+    throw new Error(
+      "[loop] failed to resolve Codex app-server for tmux launch"
+    );
+  }
+
+  opts.pairedSessionIds = { claude: claudeSessionId, codex: codexThreadId };
+  updatePairedManifest(
+    deps,
+    storage,
+    manifest,
+    claudeSessionId,
+    codexRemoteUrl,
+    codexThreadId,
+    session
+  );
+  return { claudeSessionId, codexRemoteUrl, codexThreadId };
+};
+
+const runTmuxCommand = (
+  deps: TmuxDeps,
+  args: string[],
+  message = "Failed to start tmux session"
+): void => {
+  const result = deps.spawn(args);
+  if (result.exitCode === 0) {
+    return;
+  }
+  const suffix = result.stderr ? `: ${result.stderr}` : ".";
+  throw new Error(`${message}${suffix}`);
+};
+
+const normalizePaneText = (text: string): string =>
+  text.replace(/\s+/g, " ").trim();
+
+const detectClaudePrompt = (text: string): "bypass" | "confirm" | undefined => {
+  const normalized = normalizePaneText(text);
+  if (
+    normalized.includes(CLAUDE_BYPASS_PROMPT) ||
+    (normalized.includes(CLAUDE_BYPASS_MODE) &&
+      normalized.includes(CLAUDE_BYPASS_ACCEPT) &&
+      normalized.includes(CLAUDE_EXIT_OPTION))
+  ) {
+    return "bypass";
+  }
+  if (normalized.includes(CLAUDE_TRUST_PROMPT)) {
+    return "confirm";
+  }
+  if (
+    normalized.includes(CLAUDE_DEV_CHANNELS_PROMPT) &&
+    normalized.includes(CLAUDE_DEV_CHANNELS_CONFIRM)
+  ) {
+    return "confirm";
+  }
+  return undefined;
+};
+
+const unblockClaudePane = async (
+  session: string,
+  deps: TmuxDeps
+): Promise<void> => {
+  const pane = `${session}:0.0`;
+  let handledPrompt = false;
+  let lastSnapshot = "";
+  let quietPolls = 0;
+  let sawOutput = false;
+
+  for (let attempt = 0; attempt < CLAUDE_PROMPT_MAX_POLLS; attempt += 1) {
+    const snapshot = normalizePaneText(deps.capturePane(pane));
+    const prompt = detectClaudePrompt(snapshot);
+    if (prompt === "confirm") {
+      deps.sendKeys(pane, ["Enter"]);
+      handledPrompt = true;
+      lastSnapshot = "";
+      quietPolls = 0;
+      await deps.sleep(CLAUDE_PROMPT_POLL_DELAY_MS);
+      continue;
+    }
+    if (prompt === "bypass") {
+      deps.sendKeys(pane, ["Down"]);
+      await deps.sleep(CLAUDE_PROMPT_POLL_DELAY_MS);
+      deps.sendKeys(pane, ["Enter"]);
+      handledPrompt = true;
+      lastSnapshot = "";
+      quietPolls = 0;
+      await deps.sleep(CLAUDE_PROMPT_POLL_DELAY_MS);
+      continue;
+    }
+
+    if (snapshot) {
+      sawOutput = true;
+    }
+    quietPolls = snapshot === lastSnapshot ? quietPolls + 1 : 0;
+    lastSnapshot = snapshot;
+    if (handledPrompt && quietPolls >= CLAUDE_PROMPT_SETTLE_POLLS) {
+      return;
+    }
+    if (sawOutput && quietPolls >= CLAUDE_PROMPT_SETTLE_POLLS) {
+      return;
+    }
+    if (attempt + 1 >= CLAUDE_PROMPT_MAX_POLLS) {
+      return;
+    }
+    await deps.sleep(CLAUDE_PROMPT_POLL_DELAY_MS);
+  }
+};
+
+const startPairedSession = async (
+  deps: TmuxDeps,
+  launch: PairedTmuxLaunch
+): Promise<string> => {
+  const { manifest, storage } = deps.preparePairedRun(launch.opts, deps.cwd);
+  const runBase = resolveRunBase(deps.cwd, deps, storage.runId);
+  const session = buildRunName(runBase, storage.runId);
+  if (sessionExists(session, deps.spawn)) {
+    return session;
+  }
+
+  const hadClaudeSession = Boolean(manifest.claudeSessionId);
+  const hadCodexThread = Boolean(manifest.codexThreadId);
+  const { claudeSessionId, codexRemoteUrl } = await ensurePairedSessionIds(
+    deps,
+    launch.opts,
+    storage,
+    manifest,
+    session
+  );
+  if (!launch.opts.codexMcpConfigArgs?.length) {
+    throw new Error("[loop] missing Codex bridge config for tmux launch");
+  }
+  const codexThreadId = launch.opts.pairedSessionIds?.codex;
+  if (!codexThreadId) {
+    throw new Error("[loop] failed to resolve Codex thread for tmux launch");
+  }
+  const codexProxyUrl = await deps.startCodexProxy(
+    storage.runDir,
+    codexRemoteUrl,
+    codexThreadId
+  );
+  const claudeChannelServer = resolveClaudeChannelServerName(
+    storage.runId,
+    storage.repoId,
+    manifest.claudeChannelServer
+  );
+  registerClaudeChannelServerForRun(deps, claudeChannelServer, storage.runDir);
+  try {
+    const env = [
+      `${RUN_BASE_ENV}=${runBase}`,
+      `${RUN_ID_ENV}=${storage.runId}`,
+    ];
+    const claudePrompt = buildLaunchPrompt(
+      launch,
+      "claude",
+      storage.runId,
+      claudeChannelServer
+    );
+    const codexPrompt = buildLaunchPrompt(
+      launch,
+      "codex",
+      storage.runId,
+      claudeChannelServer
+    );
+    const claudeCommand = buildShellCommand([
+      "env",
+      ...env,
+      ...buildClaudeCommand(
+        claudeSessionId,
+        resolveTmuxModel("claude", launch.opts),
+        claudeChannelServer,
+        hadClaudeSession,
+        hadClaudeSession ? undefined : claudePrompt
+      ),
+    ]);
+    const codexCommand = buildShellCommand([
+      "env",
+      ...env,
+      ...buildCodexCommand(
+        codexProxyUrl,
+        resolveTmuxModel("codex", launch.opts),
+        launch.opts.codexMcpConfigArgs ?? [],
+        hadCodexThread ? undefined : codexPrompt
+      ),
+    ]);
+
+    runTmuxCommand(deps, [
+      "tmux",
+      "new-session",
+      "-d",
+      ...buildSessionSizeArgs(deps),
+      "-s",
+      session,
+      "-c",
+      deps.cwd,
+      claudeCommand,
+    ]);
+    runTmuxCommand(
+      deps,
+      [
+        "tmux",
+        "split-window",
+        "-h",
+        "-t",
+        `${session}:0`,
+        "-c",
+        deps.cwd,
+        codexCommand,
+      ],
+      "Failed to split tmux window"
+    );
+    deps.spawn([
+      "tmux",
+      "select-layout",
+      "-t",
+      `${session}:0`,
+      "even-horizontal",
+    ]);
+    await unblockClaudePane(session, deps);
+    const primaryPane =
+      launch.opts.agent === "claude" ? `${session}:0.0` : `${session}:0.1`;
+    deps.spawn(["tmux", "select-pane", "-t", primaryPane]);
+    return session;
+  } catch (error: unknown) {
+    cleanupFailedPairedSessionStart(
+      deps,
+      session,
+      claudeChannelServer,
+      storage.runId
+    );
+    throw error;
+  }
+};
+
+const startRequestedSession = (
+  deps: TmuxDeps,
+  runBase: string,
+  requestedId: string,
+  forwardedArgv: string[]
+): string => {
+  const candidate = buildRunName(runBase, requestedId);
+  const existingSession = sessionExists(candidate, deps.spawn);
+  if (existingSession) {
+    return candidate;
+  }
+
+  const command = buildSessionCommand(
+    deps,
+    [`${RUN_BASE_ENV}=${runBase}`, `${RUN_ID_ENV}=${requestedId}`],
+    forwardedArgv
+  );
+  const result = deps.spawn([
+    "tmux",
+    "new-session",
+    "-d",
+    ...buildSessionSizeArgs(deps),
+    "-s",
+    candidate,
+    "-c",
+    deps.cwd,
+    command,
+  ]);
+  if (result.exitCode === 0) {
+    return candidate;
+  }
+
+  const suffix = result.stderr ? `: ${result.stderr}` : ".";
+  throw new Error(`Failed to start tmux session${suffix}`);
+};
+
+const startAutoSession = (
+  deps: TmuxDeps,
+  runBase: string,
+  forwardedArgv: string[],
+  needsWorktree: boolean
+): string => {
+  for (let index = 1; index <= MAX_SESSION_ATTEMPTS; index += 1) {
+    const candidate = buildRunName(runBase, index);
+    if (needsWorktree && !worktreeAvailable(deps.cwd, candidate)) {
+      continue;
+    }
+
+    const command = buildSessionCommand(
+      deps,
+      [`${RUN_BASE_ENV}=${runBase}`, `${RUN_ID_ENV}=${index}`],
+      forwardedArgv
+    );
+    const result = deps.spawn([
+      "tmux",
+      "new-session",
+      "-d",
+      ...buildSessionSizeArgs(deps),
+      "-s",
+      candidate,
+      "-c",
+      deps.cwd,
+      command,
+    ]);
+    if (result.exitCode === 0) {
+      return candidate;
+    }
+    if (!isSessionConflict(result.stderr)) {
+      const suffix = result.stderr ? `: ${result.stderr}` : ".";
+      throw new Error(`Failed to start tmux session${suffix}`);
+    }
+  }
+
+  return "";
+};
+
+const defaultDeps = (): TmuxDeps => ({
+  attach: (session: string) => {
+    const result = spawnSync(["tmux", "attach", "-t", session], {
+      stderr: "inherit",
+      stdin: "inherit",
+      stdout: "inherit",
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(`Failed to attach to tmux session "${session}".`);
+    }
+  },
+  capturePane: (pane: string) => {
+    const result = spawnSync(["tmux", "capture-pane", "-p", "-t", pane], {
+      stderr: "ignore",
+      stdout: "pipe",
+    });
+    return decode(result.stdout);
+  },
+  cwd: process.cwd(),
+  env: process.env,
+  findBinary: (cmd: string) => commandExists(cmd),
+  getCodexAppServerUrl,
+  getLastCodexThreadId,
+  getTerminalSize: () => {
+    const columns = process.stdout.columns;
+    const rows = process.stdout.rows;
+    if (!(isTerminalDimension(columns) && isTerminalDimension(rows))) {
+      return undefined;
+    }
+    return { columns, rows };
+  },
+  isInteractive: () => Boolean(process.stdin.isTTY && process.stdout.isTTY),
+  launchArgv: buildLaunchArgv(),
+  log: (line: string) => {
+    console.log(line);
+  },
+  makeClaudeSessionId: () => randomUUID(),
+  preparePairedRun,
+  runGit: (cwd: string, args: string[]) => runGit(cwd, args),
+  sendKeys: (pane: string, keys: string[]) => {
+    spawnSync(["tmux", "send-keys", "-t", pane, ...keys], { stderr: "ignore" });
+  },
+  sendText: (pane: string, text: string) => {
+    spawnSync(["tmux", "send-keys", "-t", pane, "-l", "--", text], {
+      stderr: "ignore",
+    });
+  },
+  sleep: (ms: number) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    }),
+  startCodexProxy: async (
+    runDir: string,
+    remoteUrl: string,
+    threadId: string
+  ) => {
+    const port = await findCodexTmuxProxyPort();
+    spawnDetachedProcess(
+      [
+        ...buildLaunchArgv(),
+        CODEX_TMUX_PROXY_SUBCOMMAND,
+        runDir,
+        remoteUrl,
+        threadId,
+        String(port),
+      ],
+      process.env
+    );
+    return waitForCodexTmuxProxy(port);
+  },
+  closePersistentCodexSession,
+  releasePersistentCodexSession,
+  startPersistentAgentSession,
+  spawn: (args: string[]) => {
+    const result = spawnSync(args, { stderr: "pipe" });
+    return { exitCode: result.exitCode, stderr: decode(result.stderr) };
+  },
+  updateRunManifest,
+});
+
+const findSession = (argv: string[], deps: TmuxDeps): string => {
+  const forwardedArgv = stripTmuxFlag(argv);
+  const requestedId = resolveRequestedRunId(argv, deps);
+  const runBase = resolveRunBase(deps.cwd, deps, requestedId);
+  const needsWorktree = argv.includes(WORKTREE_FLAG);
+
+  if (requestedId !== undefined) {
+    return startRequestedSession(deps, runBase, requestedId, forwardedArgv);
+  }
+
+  return startAutoSession(deps, runBase, forwardedArgv, needsWorktree);
+};
+
+const attachSessionIfInteractive = (
+  session: string,
+  deps: TmuxDeps
+): boolean => {
+  if (!deps.isInteractive()) {
+    return true;
+  }
+
+  try {
+    deps.attach(session);
+    return true;
+  } catch (error: unknown) {
+    if (isSessionGone(session, error, deps.spawn)) {
+      deps.log(
+        `[loop] tmux session "${session}" exited before attach, continuing here.`
+      );
+      return false;
+    }
+    throw error instanceof Error
+      ? error
+      : new Error(`Failed to attach to tmux session "${session}".`);
+  }
+};
+
+export const runInTmux = async (
+  argv: string[],
+  overrides: Partial<TmuxDeps> = {},
+  launch?: PairedTmuxLaunch
+): Promise<boolean> => {
+  if (!argv.includes(TMUX_FLAG)) {
+    return false;
+  }
+
+  const deps = { ...defaultDeps(), ...overrides };
+  if (deps.env.TMUX) {
+    return false;
+  }
+
+  if (!deps.findBinary("tmux")) {
+    throw new Error(TMUX_MISSING_ERROR);
+  }
+
+  const pairedLaunch =
+    Boolean(launch) &&
+    !isSingleAgentMode(argv) &&
+    Boolean(launch?.opts.pairedMode);
+  deps.log(tmuxStartupMessage(pairedLaunch));
+
+  const session =
+    pairedLaunch && launch
+      ? await startPairedSession(deps, launch)
+      : findSession(argv, deps);
+
+  if (!session) {
+    throw new Error(
+      "Failed to start tmux session: no free session name found."
+    );
+  }
+
+  if (!sessionExists(session, deps.spawn)) {
+    throw new Error(`tmux session "${session}" exited before attach.`);
+  }
+
+  keepSessionAttached(session, deps.spawn);
+
+  deps.log(`[loop] started tmux session "${session}"`);
+  deps.log(`[loop] attach with: tmux attach -t ${session}`);
+  const handedOff = attachSessionIfInteractive(session, deps);
+  if (pairedLaunch && handedOff) {
+    if (sessionExists(session, deps.spawn)) {
+      deps.releasePersistentCodexSession();
+    } else {
+      await deps.closePersistentCodexSession();
+    }
+  }
+  return handedOff;
+};
+
+export const tmuxInternals = {
+  buildClaudeCommand,
+  buildClaudeChannelServerConfig,
+  buildClaudeChannelServerName: claudeChannelServerName,
+  buildCodexCommand,
+  buildInteractivePeerPrompt,
+  buildInteractivePrimaryPrompt,
+  buildLaunchArgv,
+  buildLaunchPrompt,
+  buildPeerPrompt,
+  buildPrimaryPrompt,
+  buildRunName,
+  buildShellCommand,
+  spawnDetachedProcess,
+  isSessionConflict,
+  quoteShellArg,
+  sanitizeBase,
+  stripTmuxFlag,
+  worktreeAvailable,
+};

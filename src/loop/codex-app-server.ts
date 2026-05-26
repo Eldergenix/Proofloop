@@ -1,0 +1,1505 @@
+import { spawn } from "bun";
+import { AGENT_TURN_TIMEOUT_MS, LOOP_VERSION } from "./constants";
+import { findFreePort } from "./ports";
+import { DETACH_CHILD_PROCESS, killChildProcess } from "./process";
+import type { Options, RunResult } from "./types";
+
+type ExitSignal = "SIGINT" | "SIGTERM";
+type TransportMode = "app-server" | "exec";
+type Callback = (text: string) => void;
+export interface AppServerLaunchOptions {
+  configValues?: string[];
+  orphanOnExit?: boolean;
+  persistentThread?: boolean;
+  resumeThreadId?: string;
+  threadModel?: string;
+}
+interface RunCodexTurnCallbacks {
+  onParsed?: Callback;
+  onRaw: Callback;
+}
+
+interface JsonFrame {
+  error?: unknown;
+  id?: unknown;
+  method?: string;
+  params?: unknown;
+  result?: unknown;
+}
+
+interface PendingRequest {
+  method: string;
+  reject: (error: Error) => void;
+  resolve: (value: unknown) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+interface PendingTurnCompletion {
+  reject: (error: Error) => void;
+  resolve: () => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+interface TurnState {
+  combined: string;
+  lastChunk: string;
+  onParsed: Callback;
+  onRaw: Callback;
+  parsed: string;
+  reject: (error: Error) => void;
+  resolve: (result: RunResult) => void;
+}
+
+const APP_SERVER_CMD = "codex";
+const APP_SERVER_BASE_PORT = 4500;
+const APP_SERVER_PORT_RANGE = 100;
+const WS_CONNECT_ATTEMPTS = 40;
+const WS_CONNECT_DELAY_MS = 150;
+const USER_INPUT_TEXT_ELEMENTS = "text_elements";
+const NOOP_CALLBACK: Callback = () => undefined;
+
+export const CODEX_TRANSPORT_APP_SERVER: TransportMode = "app-server";
+export const CODEX_TRANSPORT_EXEC: TransportMode = "exec";
+export const CODEX_TRANSPORT_ENV = "CODEX_TRANSPORT";
+export const DEFAULT_CODEX_TRANSPORT: TransportMode =
+  CODEX_TRANSPORT_APP_SERVER;
+
+const METHOD_INITIALIZE = "initialize";
+const METHOD_INITIALIZED = "initialized";
+const METHOD_THREAD_START = "thread/start";
+const METHOD_THREAD_READ = "thread/read";
+const METHOD_TURN_START = "turn/start";
+const METHOD_TURN_STEER = "turn/steer";
+const METHOD_TURN_COMPLETED = "turn/completed";
+const METHOD_ERROR = "error";
+const METHOD_ITEM_COMPLETED = "item/completed";
+const METHOD_ITEM_DELTA = "item/agentMessage/delta";
+const METHOD_COMMAND_APPROVAL = "item/commandExecution/requestApproval";
+const METHOD_FILE_CHANGE_APPROVAL = "item/fileChange/requestApproval";
+const METHOD_TOOL_USER_INPUT = "item/tool/requestUserInput";
+const METHOD_TOOL_CALL = "item/tool/call";
+const METHOD_APPLY_PATCH_APPROVAL = "applyPatchApproval";
+const METHOD_EXEC_COMMAND_APPROVAL = "execCommandApproval";
+const METHOD_AUTH_REFRESH = "account/chatgptAuthTokens/refresh";
+const METHODS_TRIGGERING_FALLBACK = new Set([
+  METHOD_INITIALIZE,
+  METHOD_THREAD_START,
+  METHOD_TURN_START,
+]);
+const BRIDGE_OPT_OUT_NOTIFICATION_METHODS = [
+  METHOD_ITEM_COMPLETED,
+  METHOD_ITEM_DELTA,
+] as const;
+
+type SpawnFn = (...args: Parameters<typeof spawn>) => ReturnType<typeof spawn>;
+type ConnectWsFn = (url: string) => Promise<import("./ws-client").WsClient>;
+type BunReadableStream = ReadableStream<Uint8Array<ArrayBufferLike>>;
+interface WritableSink {
+  write(data: string): void;
+}
+
+let spawnFn: SpawnFn = spawn;
+const defaultConnectWs: ConnectWsFn = async (url) => {
+  const { connectWs } = await import("./ws-client");
+  return connectWs(url);
+};
+let connectWsFn: ConnectWsFn = defaultConnectWs;
+
+const isString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+const asString = (value: unknown): string | undefined =>
+  isString(value) ? value : undefined;
+const normalizeConfigValues = (values: string[] = []): string[] => {
+  const normalized: string[] = [];
+
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (!value) {
+      continue;
+    }
+    if (value === "-c") {
+      const next = values[index + 1];
+      if (next) {
+        normalized.push(next);
+      }
+      index += 1;
+      continue;
+    }
+    normalized.push(value);
+  }
+
+  return normalized;
+};
+const sameConfigValues = (left: string[], right: string[]): boolean =>
+  left.length === right.length &&
+  left.every((value, index) => value === right[index]);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+const asRecord = (value: unknown): Record<string, unknown> =>
+  isRecord(value) ? value : {};
+const asReadableStream = (
+  stream: ReturnType<typeof spawn>["stdout"],
+  name: string
+): BunReadableStream => {
+  if (stream instanceof ReadableStream) {
+    return stream as BunReadableStream;
+  }
+  throw new Error(`codex app-server ${name} stream is unavailable`);
+};
+const asWritableSink = (
+  value: ReturnType<typeof spawn>["stdin"]
+): WritableSink => {
+  if (isRecord(value) && typeof value.write === "function") {
+    return value as unknown as WritableSink;
+  }
+  throw new Error("codex app-server stdin is unavailable");
+};
+const asRequestId = (value: unknown): string | undefined => {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return String(value);
+  }
+  return isString(value) ? value : undefined;
+};
+
+const parseLine = (line: string): JsonFrame | undefined => {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    return isRecord(parsed) ? (parsed as JsonFrame) : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const collectText = (value: unknown, out: string[]): void => {
+  if (isString(value)) {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectText(item, out);
+    }
+    return;
+  }
+  if (!isRecord(value)) {
+    return;
+  }
+  const record = asRecord(value);
+  const direct = asString(record.text) || asString(record.delta);
+  if (direct) {
+    out.push(direct);
+  }
+  collectText(record.content, out);
+  collectText(record.item, out);
+  collectText(record.payload, out);
+};
+
+const parseText = (value: unknown): string | undefined => {
+  const parts: string[] = [];
+  collectText(value, parts);
+  return parts.length > 0
+    ? parts
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join("\n")
+    : undefined;
+};
+
+const isUnsupportedTransportError = (error: unknown): boolean => {
+  const message = parseErrorText(error)?.toLowerCase();
+  return (
+    !!message &&
+    (message.includes("unsupported") ||
+      message.includes("method not found") ||
+      message.includes("unknown method") ||
+      message.includes("unsupported transport"))
+  );
+};
+
+const parseErrorText = (value: unknown): string | undefined => {
+  const record = asRecord(value);
+  const errorRecord = asRecord(record.error);
+  const turn = asRecord(record.turn);
+  const turnError = asRecord(turn.error);
+  return (
+    asString(errorRecord.message) ||
+    asString(record.message) ||
+    asString(record.reason) ||
+    asString(turnError.message)
+  );
+};
+
+const isBusyTurnError = (value: unknown): boolean => {
+  const message = parseErrorText(value)?.toLowerCase();
+  return !!(
+    message &&
+    (message.includes("active turn") ||
+      message.includes("already active") ||
+      message.includes("busy") ||
+      message.includes("in progress") ||
+      message.includes("turn still active"))
+  );
+};
+
+const extractTurnId = (value: unknown): string | undefined => {
+  const record = asRecord(value);
+  const fromValue = asString(record.turnId) ?? asString(record.turn_id);
+  if (fromValue) {
+    return fromValue;
+  }
+  const turn = asRecord(record.turn);
+  return asString(turn.id);
+};
+
+const extractThreadId = (value: unknown): string | undefined => {
+  const record = asRecord(value);
+  return asString(record.threadId) ?? asString(record.thread_id);
+};
+
+const extractThreadFromTurnStart = (value: unknown): { id?: string } => {
+  const record = asRecord(value);
+  const thread = asRecord(record.thread);
+  return { id: asString(thread.id) };
+};
+
+const extractTurnFromStart = (value: unknown): { id?: string } => {
+  const record = asRecord(value);
+  const turn = asRecord(record.turn);
+  return { id: asString(turn.id) || asString(record.id) };
+};
+
+const extractActiveTurnId = (value: unknown): string | undefined => {
+  const thread = asRecord(asRecord(value).thread);
+  if (!Array.isArray(thread.turns)) {
+    return undefined;
+  }
+  for (let index = thread.turns.length - 1; index >= 0; index -= 1) {
+    const turn = asRecord(thread.turns[index]);
+    if (asString(turn.status) === "inProgress") {
+      return asString(turn.id);
+    }
+  }
+  return undefined;
+};
+
+const buildInput = (prompt: string): Record<string, unknown>[] => [
+  {
+    type: "text",
+    text: prompt,
+    [USER_INPUT_TEXT_ELEMENTS]: [],
+  },
+];
+
+const toError = (value: Error | unknown): Error =>
+  value instanceof Error ? value : new Error(String(value));
+
+const sendWsFrame = (
+  ws: import("./ws-client").WsClient,
+  payload: Record<string, unknown>
+): void => {
+  ws.send(`${JSON.stringify(payload)}\n`);
+};
+
+const sendWsResponse = (
+  ws: import("./ws-client").WsClient,
+  requestId: string,
+  result: unknown,
+  error: unknown
+): void => {
+  sendWsFrame(
+    ws,
+    error === undefined
+      ? { id: requestId, jsonrpc: "2.0", result }
+      : { id: requestId, error, jsonrpc: "2.0" }
+  );
+};
+
+const sendWsNotification = (
+  ws: import("./ws-client").WsClient,
+  method: string,
+  params?: Record<string, unknown>
+): void => {
+  sendWsFrame(ws, {
+    ...(params ? { params } : {}),
+    jsonrpc: "2.0",
+    method,
+  });
+};
+
+const handleWsServerRequest = (
+  ws: import("./ws-client").WsClient,
+  requestId: string,
+  method: string
+): void => {
+  if (
+    method === METHOD_COMMAND_APPROVAL ||
+    method === METHOD_FILE_CHANGE_APPROVAL
+  ) {
+    sendWsResponse(ws, requestId, { decision: "accept" }, undefined);
+    return;
+  }
+  if (method === METHOD_TOOL_USER_INPUT) {
+    sendWsResponse(ws, requestId, { answers: {} }, undefined);
+    return;
+  }
+  if (
+    method === METHOD_TOOL_CALL ||
+    method === METHOD_APPLY_PATCH_APPROVAL ||
+    method === METHOD_EXEC_COMMAND_APPROVAL ||
+    method === METHOD_AUTH_REFRESH
+  ) {
+    sendWsResponse(ws, requestId, undefined, {
+      code: -32_601,
+      message: "request unsupported by loop bridge",
+    });
+    return;
+  }
+  sendWsResponse(ws, requestId, undefined, {
+    code: -32_601,
+    message: `unsupported request method ${method}`,
+  });
+};
+
+const extractNotificationTurnId = (
+  params: Record<string, unknown>
+): string | undefined =>
+  extractTurnId(params) || asString(asRecord(params.turn).id);
+
+const settlePendingTurn = (
+  pendingTurns: Map<string, PendingTurnCompletion>,
+  turnId: string,
+  error?: Error
+): void => {
+  const turn = pendingTurns.get(turnId);
+  if (!turn) {
+    return;
+  }
+  clearTimeout(turn.timeout);
+  pendingTurns.delete(turnId);
+  if (error) {
+    turn.reject(error);
+    return;
+  }
+  turn.resolve();
+};
+
+const turnNotificationError = (
+  method: string,
+  turnId: string,
+  params: Record<string, unknown>
+): Error | undefined => {
+  if (method === METHOD_ERROR) {
+    return new Error(parseErrorText(params) || `turn ${turnId} failed`);
+  }
+  if (method !== METHOD_TURN_COMPLETED) {
+    return undefined;
+  }
+  const turn = asRecord(params.turn);
+  const status = asString(params.status) ?? asString(turn.status);
+  if (status !== "failed") {
+    return undefined;
+  }
+  return new Error(
+    parseErrorText(params) || parseErrorText(turn) || `turn ${turnId} failed`
+  );
+};
+
+const handleRemoteTurnNotification = (
+  pendingTurns: Map<string, PendingTurnCompletion>,
+  method: string,
+  params: Record<string, unknown>
+): void => {
+  const turnId = extractNotificationTurnId(params);
+  if (!turnId) {
+    return;
+  }
+  if (method !== METHOD_ERROR && method !== METHOD_TURN_COMPLETED) {
+    return;
+  }
+  settlePendingTurn(
+    pendingTurns,
+    turnId,
+    turnNotificationError(method, turnId, params)
+  );
+};
+
+const handleRemoteClientResponse = (
+  pending: Map<string, PendingRequest>,
+  requestId: string,
+  frame: JsonFrame
+): void => {
+  const request = pending.get(requestId);
+  if (!request) {
+    return;
+  }
+  clearTimeout(request.timeout);
+  pending.delete(requestId);
+  if (frame.error !== undefined) {
+    request.reject(
+      new Error(
+        parseErrorText(frame.error) ||
+          `codex app-server request "${request.method}" failed`
+      )
+    );
+    return;
+  }
+  request.resolve(frame.result);
+};
+
+const handleRemoteClientFrame = (
+  ws: import("./ws-client").WsClient,
+  pending: Map<string, PendingRequest>,
+  pendingTurns: Map<string, PendingTurnCompletion>,
+  frame: JsonFrame
+): void => {
+  const frameId = asRequestId(frame.id);
+  const method = asString(frame.method);
+  if (frameId && method) {
+    handleWsServerRequest(ws, frameId, method);
+    return;
+  }
+  if (frameId) {
+    handleRemoteClientResponse(pending, frameId, frame);
+    return;
+  }
+  if (method) {
+    handleRemoteTurnNotification(pendingTurns, method, asRecord(frame.params));
+  }
+};
+
+const createRemoteAppServerClient = async (
+  url: string
+): Promise<{
+  close(): void;
+  sendNotification(method: string, params?: Record<string, unknown>): void;
+  sendRequest(method: string, params: unknown): Promise<unknown>;
+  waitForTurnCompletion(turnId: string): Promise<void>;
+}> => {
+  const ws = await connectWsFn(url);
+  let closed = false;
+  let requestId = 1;
+  const pending = new Map<string, PendingRequest>();
+  const pendingTurns = new Map<string, PendingTurnCompletion>();
+
+  const failAll = (error: Error): void => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timeout);
+      request.reject(error);
+    }
+    pending.clear();
+    for (const turn of pendingTurns.values()) {
+      clearTimeout(turn.timeout);
+      turn.reject(error);
+    }
+    pendingTurns.clear();
+  };
+
+  ws.onmessage = (data) => {
+    for (const line of data.split("\n")) {
+      const frame = parseLine(line);
+      if (!frame) {
+        continue;
+      }
+      handleRemoteClientFrame(ws, pending, pendingTurns, frame);
+    }
+  };
+
+  ws.onclose = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    failAll(new Error("codex app-server remote connection closed"));
+  };
+
+  return {
+    close: () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      ws.close();
+      failAll(new Error("codex app-server remote connection closed"));
+    },
+    sendNotification: (method, params) => {
+      if (closed) {
+        throw new Error("codex app-server remote connection closed");
+      }
+      sendWsNotification(ws, method, params);
+    },
+    sendRequest: (method: string, params: unknown): Promise<unknown> => {
+      if (closed) {
+        return Promise.reject(
+          new Error("codex app-server remote connection closed")
+        );
+      }
+      const nextRequestId = String(requestId++);
+      try {
+        sendWsFrame(ws, { id: nextRequestId, method, params });
+      } catch (error) {
+        return Promise.reject(
+          new Error(
+            `codex app-server request "${method}" failed to write: ${
+              toError(error).message
+            }`
+          )
+        );
+      }
+
+      return new Promise<unknown>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pending.delete(nextRequestId);
+          reject(new Error(`codex app-server request "${method}" timed out`));
+        }, AGENT_TURN_TIMEOUT_MS);
+        pending.set(nextRequestId, { method, reject, resolve, timeout });
+      });
+    },
+    waitForTurnCompletion: (turnId: string): Promise<void> => {
+      if (closed) {
+        return Promise.reject(
+          new Error("codex app-server remote connection closed")
+        );
+      }
+      return new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          pendingTurns.delete(turnId);
+          reject(new Error(`codex app-server turn ${turnId} timed out`));
+        }, AGENT_TURN_TIMEOUT_MS);
+        pendingTurns.set(turnId, { reject, resolve, timeout });
+      });
+    },
+  };
+};
+
+export class CodexAppServerFallbackError extends Error {}
+export class CodexAppServerUnexpectedExitError extends CodexAppServerFallbackError {}
+
+export const codexAppServerInternals = {
+  parseLine,
+  parseText,
+  extractTurnId,
+  extractThreadId,
+  normalizeConfigValues,
+  parseErrorText,
+  setSpawnFn: (next: SpawnFn): void => {
+    spawnFn = next;
+  },
+  restoreSpawnFn: (): void => {
+    spawnFn = spawn;
+  },
+  setConnectWsFn: (next: ConnectWsFn): void => {
+    connectWsFn = next;
+  },
+  restoreConnectWsFn: (): void => {
+    connectWsFn = defaultConnectWs;
+  },
+};
+
+class AppServerClient {
+  private child: ReturnType<typeof spawn> | undefined;
+  private configValues: string[] = [];
+  private connectUrl = "";
+  private ws: import("./ws-client").WsClient | undefined;
+  private closed = false;
+  private lastThreadId = "";
+  private orphanOnExit = false;
+  private persistentThread = false;
+  private threadModel = "";
+  private started = false;
+  private ready = false;
+  private requestId = 1;
+  private readonly pending = new Map<string, PendingRequest>();
+  private readonly turns = new Map<string, TurnState>();
+  private lock: Promise<void> = Promise.resolve();
+
+  get process(): ReturnType<typeof spawn> | undefined {
+    return this.child;
+  }
+
+  getLastThreadId(): string {
+    return this.lastThreadId;
+  }
+
+  getConnectUrl(): string {
+    return this.connectUrl;
+  }
+
+  hasProcess(): boolean {
+    return this.child !== undefined;
+  }
+
+  needsRestart(options: AppServerLaunchOptions = {}): boolean {
+    if (!this.started) {
+      return false;
+    }
+    return (
+      !sameConfigValues(
+        this.configValues,
+        normalizeConfigValues(options.configValues)
+      ) || this.orphanOnExit !== (options.orphanOnExit ?? false)
+    );
+  }
+
+  configureLaunch(options: AppServerLaunchOptions = {}): void {
+    this.configValues = normalizeConfigValues(options.configValues);
+    this.orphanOnExit = options.orphanOnExit ?? false;
+    this.persistentThread = options.persistentThread ?? false;
+    if (options.resumeThreadId !== undefined) {
+      this.lastThreadId = options.resumeThreadId;
+    }
+    this.threadModel = options.threadModel ?? "";
+  }
+
+  private async ensurePersistentLaunchThread(): Promise<void> {
+    if (
+      !(
+        this.ready &&
+        this.persistentThread &&
+        !this.lastThreadId &&
+        this.threadModel
+      )
+    ) {
+      return;
+    }
+    await this.ensureThread(this.threadModel);
+  }
+
+  async start(): Promise<void> {
+    if (this.started) {
+      await this.ensurePersistentLaunchThread();
+      return;
+    }
+    this.started = true;
+    try {
+      const port = await this.findPort();
+      const listenUrl = `ws://0.0.0.0:${port}`;
+      const connectUrl = `ws://127.0.0.1:${port}`;
+      this.connectUrl = connectUrl;
+      const configArgs = this.configValues.flatMap((value) => ["-c", value]);
+      const child = spawnFn(
+        [APP_SERVER_CMD, ...configArgs, "app-server", "--listen", listenUrl],
+        {
+          detached: DETACH_CHILD_PROCESS,
+          env: process.env,
+          stderr: this.orphanOnExit ? "ignore" : "pipe",
+          stdin: this.orphanOnExit ? "ignore" : "pipe",
+          stdout: this.orphanOnExit ? "ignore" : "pipe",
+        }
+      );
+      this.child = child;
+      if (this.orphanOnExit) {
+        child.unref?.();
+        child.exited.then(() => {
+          if (!this.closed) {
+            this.handleUnexpectedExit();
+          }
+        });
+      } else {
+        this.consumeFrames(child).finally(() => {
+          if (!this.closed) {
+            this.handleUnexpectedExit();
+          }
+        });
+      }
+      const ws = await this.connectWebSocket(connectUrl);
+      this.ws = ws;
+      ws.onmessage = (data) => {
+        for (const line of data.split("\n")) {
+          if (line.trim()) {
+            this.handleStdoutLine(line);
+          }
+        }
+      };
+      ws.onclose = () => {
+        if (!this.closed) {
+          this.handleUnexpectedExit();
+        }
+      };
+      await this.sendRequest(METHOD_INITIALIZE, {
+        clientInfo: {
+          name: "loop",
+          title: "loop",
+          version: LOOP_VERSION,
+        },
+        capabilities: { experimentalApi: true },
+      });
+      this.sendNotification(METHOD_INITIALIZED);
+      this.ready = true;
+      await this.ensurePersistentLaunchThread();
+    } catch (error) {
+      const ws = this.ws;
+      this.ws = undefined;
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore close errors
+        }
+      }
+      if (this.child) {
+        killChildProcess(this.child, "SIGTERM");
+        this.child = undefined;
+      }
+      this.connectUrl = "";
+      this.ready = false;
+      this.started = false;
+      throw new CodexAppServerFallbackError(
+        toError(error).message || "failed to start codex app-server"
+      );
+    }
+  }
+
+  private findPort(): Promise<number> {
+    return findFreePort(APP_SERVER_BASE_PORT, APP_SERVER_PORT_RANGE);
+  }
+
+  private async connectWebSocket(
+    url: string
+  ): Promise<import("./ws-client").WsClient> {
+    for (let i = 0; i < WS_CONNECT_ATTEMPTS; i++) {
+      try {
+        return await connectWsFn(url);
+      } catch {
+        if (i === WS_CONNECT_ATTEMPTS - 1) {
+          throw new CodexAppServerFallbackError(
+            "failed to connect to codex app-server WebSocket"
+          );
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, WS_CONNECT_DELAY_MS)
+        );
+      }
+    }
+    throw new CodexAppServerFallbackError("unreachable");
+  }
+
+  runTurn(
+    prompt: string,
+    opts: Options,
+    onParsed: Callback,
+    onRaw: Callback,
+    resumeThreadId?: string
+  ): Promise<RunResult> {
+    const task = this.lock.then(() =>
+      this.runTurnExclusive(prompt, opts, onParsed, onRaw, resumeThreadId)
+    );
+    this.lock = task.then(
+      () => undefined,
+      () => undefined
+    );
+    return task;
+  }
+
+  interrupt(signal: ExitSignal): void {
+    killChildProcess(this.child, signal);
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    this.failAll(new Error("codex app-server closed"));
+    const ws = this.ws;
+    this.ws = undefined;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    if (!this.child) {
+      this.started = false;
+      this.ready = false;
+      return;
+    }
+    killChildProcess(this.child, "SIGTERM");
+    await this.child.exited;
+    this.child = undefined;
+    this.connectUrl = "";
+    this.ready = false;
+    this.started = false;
+  }
+
+  release(): void {
+    this.closed = true;
+    this.failAll(new Error("codex app-server released"));
+    const ws = this.ws;
+    this.ws = undefined;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    this.child = undefined;
+    this.connectUrl = "";
+    this.ready = false;
+    this.started = false;
+  }
+
+  private async ensureThread(
+    model: string,
+    resumeThreadId?: string
+  ): Promise<string> {
+    if (resumeThreadId) {
+      this.lastThreadId = resumeThreadId;
+      return resumeThreadId;
+    }
+    if (this.persistentThread && this.lastThreadId) {
+      return this.lastThreadId;
+    }
+    const response = await this.sendRequest(METHOD_THREAD_START, {
+      model,
+      approvalPolicy: "never",
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+    });
+    const thread = extractThreadFromTurnStart(response);
+    if (!thread.id) {
+      throw new CodexAppServerFallbackError(
+        "codex app-server returned thread/start without thread id"
+      );
+    }
+    this.lastThreadId = thread.id;
+    return thread.id;
+  }
+
+  private async runTurnExclusive(
+    prompt: string,
+    opts: Options,
+    onParsed: Callback,
+    onRaw: Callback,
+    resumeThreadId?: string
+  ): Promise<RunResult> {
+    if (!(this.child && this.ready)) {
+      await this.start();
+    }
+    if (!this.child) {
+      throw new CodexAppServerFallbackError("codex app-server not running");
+    }
+
+    const threadId = await this.ensureThread(opts.codexModel, resumeThreadId);
+    const response = await this.sendRequest(METHOD_TURN_START, {
+      threadId,
+      input: buildInput(prompt),
+      model: opts.codexModel,
+      effort: null,
+      cwd: null,
+    });
+    const turn = extractTurnFromStart(response);
+    if (!turn.id) {
+      throw new CodexAppServerFallbackError(
+        "codex app-server returned turn/start without turn id"
+      );
+    }
+
+    const turnId = turn.id;
+    return new Promise<RunResult>((resolve, reject) => {
+      const state: TurnState = {
+        combined: "",
+        lastChunk: "",
+        onParsed,
+        onRaw,
+        parsed: "",
+        reject,
+        resolve,
+      };
+      this.turns.set(turnId, state);
+      const timeout = setTimeout(() => {
+        if (this.turns.delete(turnId)) {
+          state.reject(new Error(`codex app-server turn ${turnId} timed out`));
+        }
+      }, AGENT_TURN_TIMEOUT_MS);
+      const clear = () => clearTimeout(timeout);
+      state.resolve = (result) => {
+        clear();
+        resolve(result);
+      };
+      state.reject = (error) => {
+        clear();
+        reject(error);
+      };
+    });
+  }
+
+  private async consumeFrames(proc: ReturnType<typeof spawn>): Promise<void> {
+    await Promise.all([
+      this.drainStream(asReadableStream(proc.stdout, "stdout")),
+      this.consumeStream(
+        asReadableStream(proc.stderr, "stderr"),
+        this.handleStdErrLine
+      ),
+    ]);
+  }
+
+  private async drainStream(stream: BunReadableStream): Promise<void> {
+    const reader = stream.getReader();
+    try {
+      while (!(await reader.read()).done) {
+        // drain only — all JSON-RPC goes through WebSocket
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private async consumeStream(
+    stream: BunReadableStream,
+    handler: (line: string) => void
+  ): Promise<void> {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const reader = stream.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (!value) {
+          continue;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        let index = buffer.indexOf("\n");
+        while (index !== -1) {
+          const line = buffer.slice(0, index);
+          handler(line);
+          buffer = buffer.slice(index + 1);
+          index = buffer.indexOf("\n");
+        }
+      }
+      if (buffer.trim()) {
+        handler(buffer.trim());
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private readonly handleStdoutLine = (line: string): void => {
+    for (const turn of this.turns.values()) {
+      turn.combined += `${line}\n`;
+      turn.onRaw(line);
+    }
+    const frame = parseLine(line);
+    if (!frame) {
+      return;
+    }
+    this.handleFrame(frame);
+  };
+
+  private readonly handleStdErrLine = (line: string): void => {
+    for (const turn of this.turns.values()) {
+      turn.combined += `${line}\n`;
+      turn.onRaw(line);
+    }
+  };
+
+  private selectTurnState(
+    payload: Record<string, unknown>
+  ): TurnState | undefined {
+    const turnId = extractTurnId(payload) || extractThreadId(payload);
+    if (turnId) {
+      return this.turns.get(turnId);
+    }
+    return this.turns.size === 1 ? [...this.turns.values()][0] : undefined;
+  }
+
+  private handleFrame(frame: JsonFrame): void {
+    const method = asString(frame.method);
+    const requestId = asRequestId(frame.id);
+
+    if (requestId && method) {
+      this.handleServerRequest(requestId, method);
+      return;
+    }
+    if (requestId) {
+      this.handleResponse(requestId, frame.result, frame.error);
+      return;
+    }
+    if (method) {
+      this.handleNotification(method, asRecord(frame.params));
+    }
+  }
+
+  private handleResponse(
+    requestId: string,
+    result: unknown,
+    err: unknown
+  ): void {
+    const request = this.pending.get(requestId);
+    if (!request) {
+      return;
+    }
+    clearTimeout(request.timeout);
+    this.pending.delete(requestId);
+    if (err !== undefined) {
+      const message =
+        parseErrorText(err) ||
+        parseErrorText({ error: err }) ||
+        `codex app-server request "${request.method}" failed`;
+      const shouldFallback =
+        isUnsupportedTransportError(err) &&
+        METHODS_TRIGGERING_FALLBACK.has(request.method);
+      if (shouldFallback) {
+        request.reject(new CodexAppServerFallbackError(message));
+      } else {
+        request.reject(new Error(message));
+      }
+      return;
+    }
+    request.resolve(result);
+  }
+
+  private handleServerRequest(requestId: string, method: string): void {
+    if (
+      method === METHOD_COMMAND_APPROVAL ||
+      method === METHOD_FILE_CHANGE_APPROVAL
+    ) {
+      this.sendResponse(requestId, { decision: "accept" }, undefined);
+      return;
+    }
+    if (method === METHOD_TOOL_USER_INPUT) {
+      this.sendResponse(requestId, { answers: {} }, undefined);
+      return;
+    }
+    if (
+      method === METHOD_TOOL_CALL ||
+      method === METHOD_APPLY_PATCH_APPROVAL ||
+      method === METHOD_EXEC_COMMAND_APPROVAL ||
+      method === METHOD_AUTH_REFRESH
+    ) {
+      this.sendResponse(requestId, undefined, {
+        code: -32_601,
+        message: "request unsupported by loop runner",
+      });
+      return;
+    }
+
+    this.sendResponse(requestId, undefined, {
+      code: -32_601,
+      message: `unsupported request method ${method}`,
+    });
+  }
+
+  private handleNotification(
+    method: string,
+    params: Record<string, unknown>
+  ): void {
+    const state = this.selectTurnState(params);
+    switch (method) {
+      case METHOD_ITEM_DELTA:
+        this.handleItemDeltaNotification(state, params);
+        return;
+      case METHOD_ITEM_COMPLETED:
+        this.handleItemCompletedNotification(state, params);
+        return;
+      case METHOD_ERROR:
+        this.handleErrorNotification(state, params);
+        return;
+      case METHOD_TURN_COMPLETED:
+        this.handleTurnCompletedNotification(state, params);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private handleItemDeltaNotification(
+    state: TurnState | undefined,
+    params: Record<string, unknown>
+  ): void {
+    if (!state) {
+      return;
+    }
+    const chunk = parseText(params.delta || params);
+    if (!chunk) {
+      return;
+    }
+    const text = chunk.trim();
+    if (!text || text === state.lastChunk) {
+      return;
+    }
+    state.lastChunk = text;
+    state.parsed = `${state.parsed ? `${state.parsed}\n` : ""}${text}`;
+    state.onParsed(text);
+  }
+
+  private handleItemCompletedNotification(
+    state: TurnState | undefined,
+    params: Record<string, unknown>
+  ): void {
+    if (!state) {
+      return;
+    }
+    const item = asRecord(params.item);
+    const itemType = asString(item.type);
+    if (itemType !== "agentMessage" && itemType !== "agent_message") {
+      return;
+    }
+    const text = parseText(item);
+    if (!text) {
+      return;
+    }
+    const candidate = text.trim();
+    if (!candidate || candidate === state.lastChunk) {
+      return;
+    }
+    state.lastChunk = candidate;
+    state.parsed = `${state.parsed ? `${state.parsed}\n` : ""}${candidate}`;
+    state.onParsed(candidate);
+  }
+
+  private handleErrorNotification(
+    state: TurnState | undefined,
+    params: Record<string, unknown>
+  ): void {
+    const turnId = extractTurnId(params) || extractThreadId(params);
+    if (state) {
+      for (const [turnId, current] of this.turns.entries()) {
+        if (current === state) {
+          this.turns.delete(turnId);
+          break;
+        }
+      }
+      state.reject(new Error(parseErrorText(params) || "codex turn failed"));
+      return;
+    }
+    if (turnId && this.turns.has(turnId)) {
+      const activeState = this.turns.get(turnId);
+      if (!activeState) {
+        return;
+      }
+      this.turns.delete(turnId);
+      activeState.reject(
+        new Error(parseErrorText(params) || `turn ${turnId} failed`)
+      );
+      return;
+    }
+    if (turnId) {
+      return;
+    }
+    if (this.turns.size !== 1) {
+      return;
+    }
+    const [first] = this.turns.values();
+    this.turns.clear();
+    first?.reject(new Error(parseErrorText(params) || "codex turn failed"));
+  }
+
+  private handleTurnCompletedNotification(
+    state: TurnState | undefined,
+    params: Record<string, unknown>
+  ): void {
+    const turnId = extractTurnId(params) || extractThreadId(params);
+    if (!state) {
+      if (turnId) {
+        return;
+      }
+      if (this.turns.size !== 1) {
+        return;
+      }
+      const first = [...this.turns.values()][0];
+      if (!first) {
+        return;
+      }
+      this.resolveTurnState(first, params);
+      return;
+    }
+    this.resolveTurnState(state, params);
+  }
+
+  private resolveTurnState(
+    state: TurnState,
+    params: Record<string, unknown>
+  ): void {
+    const turn = asRecord(params.turn);
+    const status = asString(params.status) ?? asString(turn.status);
+    const exitCode = status === "failed" ? 1 : 0;
+    const turnId = extractTurnId(params) || asString(turn.id);
+
+    if (turnId && this.turns.has(turnId)) {
+      this.turns.delete(turnId);
+    } else {
+      for (const [key, value] of this.turns.entries()) {
+        if (value === state) {
+          this.turns.delete(key);
+          break;
+        }
+      }
+    }
+
+    if (exitCode === 1) {
+      const message =
+        parseErrorText(params) || parseErrorText(turn) || "codex turn failed";
+      const nextParsed = message
+        ? `${state.parsed ? `${state.parsed}\n` : ""}${message}`
+        : state.parsed;
+      state.resolve({
+        combined: state.combined,
+        exitCode,
+        parsed: nextParsed,
+      });
+      return;
+    }
+
+    state.resolve({
+      combined: state.combined,
+      exitCode: 0,
+      parsed: state.parsed,
+    });
+  }
+
+  private sendRequest(method: string, params: unknown): Promise<unknown> {
+    if (!(this.ws || this.child) || this.closed) {
+      return Promise.reject(
+        new CodexAppServerFallbackError("codex app-server not initialized")
+      );
+    }
+    const requestId = String(this.requestId++);
+    const payload: Record<string, unknown> = {
+      id: requestId,
+      method,
+      params,
+    };
+    try {
+      this.sendFrame(payload);
+    } catch (error) {
+      throw new CodexAppServerFallbackError(
+        `codex app-server request "${method}" failed to write: ${
+          toError(error).message
+        }`
+      );
+    }
+
+    return new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(requestId);
+        reject(new Error(`codex app-server request "${method}" timed out`));
+      }, AGENT_TURN_TIMEOUT_MS);
+      this.pending.set(requestId, { method, resolve, reject, timeout });
+    });
+  }
+
+  private sendFrame(payload: Record<string, unknown>): void {
+    const data = `${JSON.stringify(payload)}\n`;
+    if (this.ws) {
+      this.ws.send(data);
+    } else if (this.child) {
+      asWritableSink(this.child.stdin).write(data);
+    }
+  }
+
+  private sendResponse(
+    requestId: string,
+    result: unknown,
+    error: unknown
+  ): void {
+    if (!(this.ws || this.child)) {
+      return;
+    }
+    const payload =
+      error === undefined
+        ? { id: requestId, result, jsonrpc: "2.0" }
+        : { id: requestId, error, jsonrpc: "2.0" };
+    this.sendFrame(payload);
+  }
+
+  private sendNotification(
+    method: string,
+    params?: Record<string, unknown>
+  ): void {
+    this.sendFrame({
+      ...(params ? { params } : {}),
+      jsonrpc: "2.0",
+      method,
+    });
+  }
+
+  private failAll(error: Error): void {
+    for (const state of this.turns.values()) {
+      state.reject(error);
+    }
+    this.turns.clear();
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timeout);
+      request.reject(error);
+    }
+    this.pending.clear();
+  }
+
+  private handleUnexpectedExit(): void {
+    this.child = undefined;
+    this.connectUrl = "";
+    const ws = this.ws;
+    this.ws = undefined;
+    if (ws) {
+      try {
+        ws.close();
+      } catch {
+        // ignore close errors
+      }
+    }
+    this.started = false;
+    this.ready = false;
+    this.failAll(
+      new CodexAppServerUnexpectedExitError(
+        "codex app-server exited unexpectedly"
+      )
+    );
+  }
+}
+
+let singleton: AppServerClient | undefined;
+
+process.on("exit", () => {
+  killChildProcess(singleton?.process, "SIGKILL");
+});
+
+const getClient = (): AppServerClient => {
+  if (!singleton) {
+    singleton = new AppServerClient();
+  }
+  return singleton;
+};
+
+export const useAppServer = (): boolean =>
+  process.env[CODEX_TRANSPORT_ENV] !== CODEX_TRANSPORT_EXEC;
+
+export const startAppServer = async (
+  options: AppServerLaunchOptions = {}
+): Promise<void> => {
+  const existing = singleton;
+  const shouldRestart = existing?.needsRestart(options) ?? false;
+  const resumeThreadId =
+    options.resumeThreadId ??
+    (options.persistentThread ? existing?.getLastThreadId() : undefined);
+  if (shouldRestart) {
+    await closeAppServer();
+  }
+  const client = getClient();
+  client.configureLaunch(
+    resumeThreadId === undefined ? options : { ...options, resumeThreadId }
+  );
+  await client.start();
+};
+
+export const runCodexTurn = (
+  prompt: string,
+  opts: Options,
+  // Some callers render directly from raw events and intentionally skip parsed callbacks.
+  callbacks: RunCodexTurnCallbacks,
+  resumeThreadId?: string
+): Promise<RunResult> => {
+  return getClient().runTurn(
+    prompt,
+    opts,
+    callbacks.onParsed ?? NOOP_CALLBACK,
+    callbacks.onRaw,
+    resumeThreadId
+  );
+};
+
+export const interruptAppServer = (signal: ExitSignal): void => {
+  getClient().interrupt(signal);
+};
+
+export const hasAppServerProcess = (): boolean => getClient().hasProcess();
+
+export const getCodexAppServerUrl = (): string =>
+  singleton?.getConnectUrl() ?? "";
+
+export const getLastCodexThreadId = (): string =>
+  singleton?.getLastThreadId() ?? "";
+
+export const injectCodexMessage = async (
+  remoteUrl: string,
+  threadId: string,
+  prompt: string
+): Promise<boolean> => {
+  if (!(remoteUrl && threadId && prompt.trim())) {
+    return false;
+  }
+  const client = await createRemoteAppServerClient(remoteUrl);
+  try {
+    await client.sendRequest(METHOD_INITIALIZE, {
+      clientInfo: {
+        name: "loop-bridge",
+        title: "loop-bridge",
+        version: LOOP_VERSION,
+      },
+      capabilities: {
+        experimentalApi: true,
+        optOutNotificationMethods: [...BRIDGE_OPT_OUT_NOTIFICATION_METHODS],
+      },
+    });
+    client.sendNotification(METHOD_INITIALIZED);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let activeTurnId: string | undefined;
+      try {
+        const thread = await client.sendRequest(METHOD_THREAD_READ, {
+          includeTurns: true,
+          threadId,
+        });
+        activeTurnId = extractActiveTurnId(thread);
+      } catch {
+        activeTurnId = undefined;
+      }
+
+      if (activeTurnId) {
+        try {
+          await client.sendRequest(METHOD_TURN_STEER, {
+            expectedTurnId: activeTurnId,
+            input: buildInput(prompt),
+            threadId,
+          });
+          return true;
+        } catch {
+          // The active turn may have already completed. Fall through to start.
+        }
+      }
+
+      try {
+        const response = await client.sendRequest(METHOD_TURN_START, {
+          input: buildInput(prompt),
+          threadId,
+        });
+        const turn = extractTurnFromStart(response);
+        if (!turn.id) {
+          throw new Error(
+            "codex app-server returned turn/start without turn id"
+          );
+        }
+        return true;
+      } catch (error) {
+        if (!(attempt === 0 && isBusyTurnError(error))) {
+          throw error;
+        }
+      }
+    }
+    return false;
+  } finally {
+    client.close();
+  }
+};
+
+export const closeAppServer = async (): Promise<void> => {
+  if (!singleton) {
+    return;
+  }
+  await singleton.close();
+  singleton = undefined;
+};
+
+export const releaseAppServer = (): void => {
+  if (!singleton) {
+    return;
+  }
+  singleton.release();
+  singleton = undefined;
+};
